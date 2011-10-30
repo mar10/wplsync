@@ -27,8 +27,13 @@ import shutil
 
 
 DEFAULT_OPTS = {
-    "copy_extensions": ["mp3", ],
-    "copy_files": ["Folder.jpg", "AlbumArtSmall.jpg"],
+    "media_extensions": ["mp3", 
+                         ],
+    "volatile_files": [".DS_Store",
+                       ],
+    "copy_files": ["Folder.jpg", 
+                   "AlbumArtSmall.jpg",
+                   ],
 }
 
 
@@ -44,17 +49,53 @@ def create_info_dict():
     return res
 
 
+def canonical_path(p):
+    res = os.path.normcase(os.path.normpath(os.path.abspath(p)))
+    return res
+
+
+def check_path_independent(p1, p2):
+    """Return True if p1 and p2 don't overlap."""
+    p1 = canonical_path(p1) + "/"
+    p2 = canonical_path(p2) + "/"
+    return not (p1.startswith(p2) or p2.startswith(p1)) 
+
+
+def copy_file(opts, src, dest):
+    assert os.path.isfile(src)
+    assert not dest.startswith(opts.source_folder) # Never change the source folder
+
+#    if opts.verbose >= 2:
+#        print 'Copy: %s' % dest
+    dir = os.path.dirname(dest)
+    if not opts.dry_run:
+        if not os.path.exists(dir):
+            os.makedirs(dir)
+        shutil.copy2(src, dest)
+    return
+
+        
+def delete_file(opts, fspec):
+    assert os.path.isfile(fspec)
+    assert opts.delete_orphans
+    assert not fspec.startswith(opts.source_folder) # Never change the source folder
+#    if opts.verbose >= 2:
+#        print 'Delete: %s' % dest
+    if not opts.dry_run:
+        os.remove(fspec)
+    return
+
+        
 def add_file_info(opts, info_dict, fspec):
     assert os.path.isabs(fspec)
     info_dict["process_count"] += 1
     # Get path relative to the synced folder
     rel_path = os.path.relpath(fspec, info_dict["root_folder"])
-#    print "rel_path=", rel_path
 
     if not fnmatch(fspec, "*.mp3"):
         info_dict["skip_count"] += 1
-        if opts.verbose >= 2:
-            print "skipping %s" % fspec
+        if opts.verbose >= 3:
+            print "Skipping %s" % fspec
     elif not os.path.isfile(fspec):
         info_dict["skip_count"] += 1
         info_dict["error_count"] += 1
@@ -62,30 +103,27 @@ def add_file_info(opts, info_dict, fspec):
             print "File not found: '%s'" % fspec
     else:
         info_dict["file_list"].append(fspec)
-        size = os.path.getsize(fspec)
-        modified = os.path.getmtime(fspec)
-        created = os.path.getctime(fspec)
+#        size = os.path.getsize(fspec)
+#        modified = os.path.getmtime(fspec)
+#        created = os.path.getctime(fspec)
         info = {"fspec": fspec,
                 "rel_path": rel_path,
-                "size": size,
-                "modified": modified,
-                "created": created}
+#                "size": size,
+#                "modified": modified,
+#                "created": created,
+                }
         info_dict["file_map"][rel_path] = info
         return True
     return False
 
 
-def read_folder_files(opts, folder_path, is_target):
+def read_folder_files(opts, folder_path):
     if opts.verbose >= 1:
-        print 'Reading folder %s...' % (folder_path, )
+        print 'Reading folder "%s" ...' % (folder_path, )
     res = create_info_dict()
-    if is_target:
-        res["root_folder"] = opts.target_folder
-    else:
-        res["root_folder"] = opts.source_folder
+    res["root_folder"] = folder_path
+
     for dirname, dirnames, filenames in os.walk(folder_path):
-#        for subdirname in dirnames:
-#            print os.path.join(dirname, subdirname)
         for filename in filenames:
             fspec = os.path.join(dirname, filename)
             add_file_info(opts, res, fspec)
@@ -99,7 +137,7 @@ def read_playlist_wpl(opts, playlist_path, info):
     assert os.path.isabs(playlist_path)
     
     if opts.verbose >= 1:
-        print 'Parsing playlist "%s"...' % (playlist_path, )
+        print 'Parsing playlist "%s" ...' % (playlist_path, )
     tree = ET.parse(playlist_path)
     
     try:
@@ -115,7 +153,7 @@ def read_playlist_wpl(opts, playlist_path, info):
         # If the fspec was given relative, it is relative to the playlist
         if not os.path.isabs(fspec):
             fspec = os.path.join(playlist_folder, fspec)
-            fspec = os.path.normcase(os.path.normpath(os.path.abspath(fspec)))
+            fspec = canonical_path(fspec)
         add_file_info(opts, info, fspec)
     # TODO: faster sequential approach:
     # iparse = ET.iterparse(playlist_path, ["end", ])
@@ -127,81 +165,80 @@ def read_playlist_wpl(opts, playlist_path, info):
 
 def read_source_files(opts):
     """Read source files (either complete folder or using given playlists)."""
+    if len(opts.playlist_paths) == 0:
+        return read_folder_files(opts, opts.source_folder)
     res = create_info_dict()
     res["root_folder"] = opts.source_folder
-    if len(opts.playlist_paths) == 0:
-        read_folder_files(opts, opts.source_folder)
-    else:
-        for pl in opts.playlist_paths:
+    for pl in opts.playlist_paths:
+        ext = os.path.splitext(pl).lowercase()
+        if ext == "wpl":
             read_playlist_wpl(opts, pl, res)
+        else:
+            raise NotImplementedError("Unsupported playlist extension: %r" % ext)
     return res
 
 
-def copy_file(opts, src, dest):
-    assert os.path.isfile(src)
-    if opts.verbose >= 1:
-        print 'Copy: %s' % dest
-    dir = os.path.dirname(dest)
-    if not os.path.exists(dir):
-        os.makedirs(dir)
-    shutil.copy2(src, dest)
-
-        
 def sync_file_lists(opts, source_map, target_map):
     """Unify leading spaces and tabs and strip trailing whitespace.
     
     """
-    # Pass 1: find orphans
+    # Pass 1: find orphans and record folders
+    target_folders = {}
     orphans = []
     for rel_path, target_info in target_map["file_map"].iteritems():
         src_info = source_map["file_map"].get(rel_path)
+        folder = os.path.splitext(target_info["fspec"])
+
         if not src_info:
             # Removed
-            if opts.verbose >= 1:
-                print 'REMOVED: %s' % rel_path
+            if opts.verbose >= 2:
+                print 'Delete: %s' % rel_path
             orphans.append(target_info)
+
     # Pass 2: copy files
-    match_count = 0
+    match_count1 = 0
     match_count2 = 0
+    new_count = 0
     for rel_path, src_info in source_map["file_map"].iteritems():
         target_info = target_map["file_map"].get(rel_path)
         if target_info:
-            match_count += 1
             if filecmp.cmp(src_info["fspec"], target_info["fspec"], shallow=True):
                 # Identical
-                match_count2 += 1
-                if opts.verbose >= 2:
-                    print 'IDENTICAL: %s' % rel_path
+                match_count1 += 1
+                if opts.verbose >= 3:
+                    print 'Ignore: %s' % rel_path
             else:
                 # Modified
-                if opts.verbose >= 1:
-                    print 'MODIFIED: %s' % rel_path
+                match_count2 += 1
+                if opts.verbose >= 2:
+                    print 'Update: %s' % rel_path
                 shutil.copy2(src_info["fspec"], target_info["fspec"])
         else:
             # New
-            if opts.verbose >= 1:
-                print 'NEW: %s' % rel_path
-                target_fspec = os.path.join(opts.target_folder, rel_path)
-#                print 'copy2: %s' % target_fspec
-#            shutil.copy2(src_info["fspec"], target_fspec)
+            new_count += 1
+            if opts.verbose >= 2:
+                print 'Copy: %s' % rel_path
+            target_fspec = os.path.join(opts.target_folder, rel_path)
             copy_file(opts, src_info["fspec"], target_fspec)
 
     if opts.verbose >= 1:
-        print 'Found %s matches, %s identical, %s orphans' % (match_count, match_count2, len(orphans))
+        print('Compared %s files. Identical: %s, modified: %s, new: %s, orphans: %s.' 
+              % (len(source_map["file_map"]), match_count1, match_count2, new_count, len(orphans)))
 
     # Pass 2: remove
     if opts.delete_orphans:
-        pass
+        for fspec in orphans:
+            delete_files(opts, )
 
 
 
 def run():
     # Create option parser for common and custom options
-    parser = OptionParser(prog="plsync", # Otherwise 'plsync-script.py' gets displayed
+    parser = OptionParser(#prog="wplsync", # Otherwise 'wplsync-script.py' gets displayed on windows
                           version=__version__,
                           usage="usage: %prog [options] SOURCE_FOLDER TARGET_FOLDER [PLAYLIST [, PLAYLIST...]]",
                           description="Synchronize two media folders, optionally filtered by playlists.",
-                          epilog="See also http://tabfix.googlecode.com")
+                          epilog="See also http://wplsync.googlecode.com")
 
     parser.add_option("-x", "--execute",
                       action="store_false", dest="dry_run", default=True,
@@ -244,28 +281,30 @@ def run():
     elif not os.path.isdir(args[1]):
         parser.error("TARGET_FOLDER must be a folder")
 
-    options.source_folder = os.path.normcase(os.path.normpath(os.path.abspath(args[0])))
-    options.target_folder = os.path.normcase(os.path.normpath(os.path.abspath(args[1])))
+    options.source_folder = canonical_path(args[0])
+    options.target_folder = canonical_path(args[1])
+
+    if not check_path_independent(options.source_folder, options.target_folder):
+        parser.error("SOURCE_FOLDER and TARGET_FOLDER must not overlap")
 
     options.playlist_paths = []
     for pl in args[2:]:
-        pl = os.path.normcase(os.path.normpath(os.path.abspath(pl)))
+        pl = canonical_path(pl)
         if not os.path.isfile(pl):
             parser.error("'%s' must be a playlist file" % pl)
         options.playlist_paths.append(pl)
 
     # Call processor
     source_info = read_source_files(options)
-    target_info = read_folder_files(options, options.target_folder, True)
+    target_info = read_folder_files(options, options.target_folder)
 
     if options.verbose >= 1:
         print "Source: %s files, %s valid" % (source_info["process_count"],
-                                              len(source_info["file_list"])
+                                              len(source_info["file_map"])
                                               )
         print "Target: %s files, %s valid" % (target_info["process_count"],
-                                              len(target_info["file_list"])
+                                              len(target_info["file_map"])
                                               )
-
     sync_file_lists(options, source_info, target_info)
     
     if options.dry_run and options.verbose >= 1:
