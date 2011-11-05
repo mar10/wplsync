@@ -54,7 +54,7 @@ setup(name = "WplSync",
       keywords = "playlist wpl folder sync", 
       license = "The MIT License",
 #      install_requires = ["lxml"],
-      # Add support for Mercurial revision control system, so we don't nee MANIFEST.in
+      # Add support for Mercurial revision control system, so we don't need MANIFEST.in
       setup_requires = ["setuptools_hg"],
       packages = find_packages(exclude=[]),
 #      py_modules = ["wplsync", "distribute_setup"],
