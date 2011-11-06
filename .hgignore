@@ -2,3 +2,4 @@ syntax: glob
 WplSync.egg-info
 dist
 *.pyc
+*.
